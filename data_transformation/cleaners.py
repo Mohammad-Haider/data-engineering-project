@@ -60,7 +60,7 @@ def clean_jobs_dataframe(df):
         return df
         
     def _fingerprint_row(row):
-        ext = row.get("jsearch_job_id")
+        ext = row.get("jsearch_job_id") or row.get("adzuna_job_id")
         return generate_fingerprint(row.get("title"), row.get("company"), row.get("location"), ext)
 
     df["fingerprint"] = df.apply(_fingerprint_row, axis=1)

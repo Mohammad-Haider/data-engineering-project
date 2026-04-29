@@ -8,7 +8,7 @@ import sys
 # Add parent directory to path so we can import modules when running as a script
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from data_ingestion.scrapers.rozee_scraper import RozeeScraper
+from data_ingestion.api_clients.adzuna_client import AdzunaClient
 from data_ingestion.api_clients.jsearch_client import JSearchClient
 from data_transformation.cleaners import clean_jobs_dataframe
 from analytics_ml.salary_prediction.train_model import train_salary_model
@@ -17,19 +17,38 @@ from analytics_ml.salary_prediction.train_model import train_salary_model
 DB_URL = os.environ.get("DATABASE_URL", "mysql+pymysql://appuser:apppassword@localhost:3307/job_market_db")
 
 @task(retries=3, retry_delay_seconds=60)
-def extract_rozee_jobs():
-    """Extracts job postings from Rozee.pk"""
-    logging.info("Extracting data from Rozee.pk...")
-    scraper = RozeeScraper()
-    jobs = scraper.scrape(num_pages=1)
+def extract_adzuna_jobs():
+    """Extracts job postings from Adzuna API."""
+    logging.info("Extracting data from Adzuna API...")
+    client = AdzunaClient()
+    pages = int(os.environ.get("ADZUNA_PAGES", "20"))
+    results_per_page = int(os.environ.get("ADZUNA_RESULTS_PER_PAGE", "50"))
+    role_queries = [
+        "software engineer",
+        "backend developer",
+        "frontend developer",
+        "full stack developer",
+        "data engineer",
+        "data scientist",
+        "devops engineer",
+        "qa engineer",
+        "machine learning engineer",
+        "product manager",
+    ]
+
+    jobs = []
+    for role in role_queries:
+        role_jobs = client.fetch_jobs(query=role, pages=pages, results_per_page=results_per_page)
+        jobs.extend(role_jobs)
+
     if not jobs:
-        logging.warning("No jobs scraped from Rozee.pk. Returning dummy data.")
+        logging.warning("No jobs fetched from Adzuna API. Returning fallback row.")
         return [{
             "title": "Data Engineer",
             "company": "Tech Corp",
             "location": "Lahore",
             "salary_raw": "100k-150k",
-            "source": "Rozee.pk (fallback)"
+            "source": "Adzuna (fallback)"
         }]
     return jobs
 
@@ -83,10 +102,10 @@ def extract_jsearch_jobs():
     return jobs
 
 @task
-def transform_jobs(rozee_data, jsearch_data):
+def transform_jobs(adzuna_data, jsearch_data):
     """Cleans and deduplicates job data"""
     logging.info("Transforming combined data...")
-    combined_data = rozee_data + jsearch_data
+    combined_data = adzuna_data + jsearch_data
     df = pd.DataFrame(combined_data)
     clean_df = clean_jobs_dataframe(df)
     return clean_df
@@ -181,11 +200,11 @@ def trigger_model_training():
 def daily_job_pipeline():
     """Main execution flow"""
     # 1. Extraction
-    rozee_data = extract_rozee_jobs()
+    adzuna_data = extract_adzuna_jobs()
     jsearch_data = extract_jsearch_jobs()
     
     # 2. Transformation
-    cleaned_data = transform_jobs(rozee_data, jsearch_data)
+    cleaned_data = transform_jobs(adzuna_data, jsearch_data)
     
     # 3. Loading
     load_to_mysql(cleaned_data)

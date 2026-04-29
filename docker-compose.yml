@@ -30,7 +30,7 @@ services:
       - DATABASE_URL=mysql+pymysql://appuser:apppassword@db:3306/job_market_db
 
   prefect-server:
-    image: prefecthq/prefect:2-python3.9
+    image: prefecthq/prefect:3-python3.10
     container_name: prefect_server
     command: prefect server start --host 0.0.0.0
     ports:

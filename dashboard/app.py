@@ -5,6 +5,9 @@ from sqlalchemy import create_engine
 import joblib
 import os
 
+# Resolve project root regardless of where streamlit is started from
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
 # Page config
 st.set_page_config(
     page_title="Pakistan Job Market Intelligence",
@@ -67,7 +70,7 @@ with tab2:
     p_exp = st.slider("Years of Experience", 0, 20, 2)
     
     if st.button("Predict Salary"):
-        model_path = 'analytics_ml/salary_prediction/salary_model.pkl'
+        model_path = os.path.join(BASE_DIR, 'analytics_ml', 'salary_prediction', 'salary_model.pkl')
         if os.path.exists(model_path):
             try:
                 model = joblib.load(model_path)
@@ -85,11 +88,26 @@ with tab2:
 with tab3:
     st.subheader("Skills Demand")
     st.markdown("Most in-demand skills in the selected region.")
-    
-    # In a full implementation, we would extract skills from descriptions using NLP and store in job_skills
-    # For now, display dummy data
-    skills_data = pd.DataFrame({
-        'Skill': ['Python', 'SQL', 'AWS', 'React', 'Docker'],
-        'Demand Score': [95, 88, 76, 72, 65]
-    }).set_index('Skill')
-    st.bar_chart(skills_data)
+
+    # Use live DB counts from job title + description text.
+    skills_query = """
+    SELECT 'Python' AS Skill, SUM(CASE WHEN LOWER(CONCAT(IFNULL(title, ''), ' ', IFNULL(description, ''))) LIKE '%%python%%' THEN 1 ELSE 0 END) AS demand
+    FROM jobs
+    UNION ALL
+    SELECT 'SQL', SUM(CASE WHEN LOWER(CONCAT(IFNULL(title, ''), ' ', IFNULL(description, ''))) LIKE '%%sql%%' THEN 1 ELSE 0 END) FROM jobs
+    UNION ALL
+    SELECT 'AWS', SUM(CASE WHEN LOWER(CONCAT(IFNULL(title, ''), ' ', IFNULL(description, ''))) LIKE '%%aws%%' THEN 1 ELSE 0 END) FROM jobs
+    UNION ALL
+    SELECT 'React', SUM(CASE WHEN LOWER(CONCAT(IFNULL(title, ''), ' ', IFNULL(description, ''))) LIKE '%%react%%' THEN 1 ELSE 0 END) FROM jobs
+    UNION ALL
+    SELECT 'Docker', SUM(CASE WHEN LOWER(CONCAT(IFNULL(title, ''), ' ', IFNULL(description, ''))) LIKE '%%docker%%' THEN 1 ELSE 0 END) FROM jobs
+    """
+
+    skills_df = fetch_data(skills_query)
+    if not skills_df.empty:
+        skills_df['demand'] = skills_df['demand'].fillna(0).astype(int)
+        skills_df = skills_df.sort_values('demand', ascending=False)
+        skills_data = skills_df.set_index('Skill').rename(columns={'demand': 'Demand Score'})
+        st.bar_chart(skills_data)
+    else:
+        st.info("No skill demand data available yet.")

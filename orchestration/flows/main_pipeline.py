@@ -1,9 +1,11 @@
 from prefect import flow, task
 import logging
-import pandas as pd
-from sqlalchemy import create_engine, text
 import os
 import sys
+import time
+
+import pandas as pd
+from sqlalchemy import create_engine, text
 
 # Add parent directory to path so we can import modules when running as a script
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
@@ -82,7 +84,8 @@ def extract_jsearch_jobs():
     ]
 
     jobs = []
-    for role in role_queries:
+    pause_between_roles = float(os.environ.get("JSEARCH_PAUSE_BETWEEN_ROLES_SEC", "3.5"))
+    for i, role in enumerate(role_queries):
         try:
             role_jobs = client.fetch_jobs(
                 query=role,
@@ -95,6 +98,8 @@ def extract_jsearch_jobs():
             jobs.extend(role_jobs)
         except Exception as e:
             logging.error("JSearch fetch failed for query '%s': %s", role, e)
+        if pause_between_roles > 0 and i < len(role_queries) - 1:
+            time.sleep(pause_between_roles)
 
     if not jobs:
         logging.warning("No jobs fetched from JSearch API. Returning dummy data.")

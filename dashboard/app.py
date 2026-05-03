@@ -2,14 +2,19 @@
 Pakistan Tech Job Market Intelligence Platform — redesigned dashboard.
 Matches target UX: dark sidebar, card-based analytics, DB-backed charts.
 """
+import logging
 import os
+import time
 from datetime import datetime
+from decimal import Decimal
+from pathlib import Path
 
 import joblib
+import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 try:
     import matplotlib.pyplot as plt
@@ -19,6 +24,24 @@ except ImportError:
     _HAS_MPL = False
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+_LOG = logging.getLogger(__name__)
+
+
+def _configure_logging() -> None:
+    """Stdout logging for Streamlit (inference, DB errors). Set LOG_LEVEL=DEBUG for verbose."""
+    if getattr(_configure_logging, "_done", False):
+        return
+    level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)-5s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+        force=True,
+    )
+    _configure_logging._done = True  # type: ignore[attr-defined]
+
 
 # --- Theme (aligned with reference screenshots) ---
 COL_BG_MAIN = "#eef2ef"
@@ -52,11 +75,14 @@ def inject_css():
         [data-testid="stSidebar"] .block-container {{
             padding-top: 1.5rem;
         }}
-        [data-testid="stSidebar"] label, [data-testid="stSidebar"] p, [data-testid="stSidebar"] span {{
-            color: #e8f0ec !important;
+        [data-testid="stSidebar"] label,
+        [data-testid="stSidebar"] p,
+        [data-testid="stSidebar"] span,
+        [data-testid="stSidebar"] li {{
+            color: #ffffff !important;
         }}
-        [data-testid="stSidebar"] .stRadio label {{
-            font-size: 0.9rem;
+        [data-testid="stSidebar"] p strong {{
+            color: #ffffff !important;
         }}
         [data-testid="stSidebar"] hr {{
             border-color: rgba(255,255,255,0.12);
@@ -142,8 +168,51 @@ def fetch_data(query, params=None):
             return pd.read_sql(query, engine, params=params)
         return pd.read_sql(query, engine)
     except Exception as e:
-        st.error(f"Database error: {e}")
+        _LOG.error("Database query failed: %s", e)
         return pd.DataFrame()
+
+
+def _coerce_year_month(val) -> str | None:
+    """Normalize SQL/pandas month keys to 'YYYY-MM' for safe label parsing."""
+    if val is None:
+        return None
+    try:
+        if val is not None and pd.isna(val):
+            return None
+    except TypeError:
+        pass
+    ts = pd.to_datetime(val, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return ts.strftime("%Y-%m")
+
+
+def _arrow_friendly_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Avoid Arrow/frontend issues (e.g. Decimal, bytes) on st.dataframe / st.bar_chart."""
+    if df.empty:
+        return df
+    out = df.copy()
+    for c in out.columns:
+        col = out[c]
+        dtype_name = str(col.dtype).lower()
+        if dtype_name.startswith("decimal") or "decimal" in dtype_name:
+            out[c] = pd.to_numeric(col, errors="coerce")
+            continue
+        if col.dtype != object:
+            continue
+        sample = col.dropna().head(1)
+        if sample.empty:
+            continue
+        v = sample.iloc[0]
+        if isinstance(v, Decimal):
+            out[c] = pd.to_numeric(col, errors="coerce")
+        elif isinstance(v, (bytes, bytearray)):
+            out[c] = col.apply(
+                lambda x: x.decode("utf-8", errors="replace")
+                if isinstance(x, (bytes, bytearray))
+                else x
+            )
+    return out
 
 
 def _job_postings_by_month_and_source():
@@ -173,6 +242,14 @@ def render_job_postings_over_time():
         st.info("No time series yet.")
         return
 
+    df = df.copy()
+    df["ym"] = df["ym"].map(_coerce_year_month)
+    df = df.dropna(subset=["ym"])
+    if df.empty:
+        _card_start("Job Postings Over Time", "Monthly trend by source.")
+        st.info("No time series yet.")
+        return
+
     df["cnt"] = pd.to_numeric(df["cnt"], errors="coerce").fillna(0)
     pivot = df.pivot_table(index="ym", columns="src", values="cnt", aggfunc="sum").fillna(0)
     pivot = pivot.sort_index()
@@ -190,12 +267,12 @@ def render_job_postings_over_time():
     yms = [str(x) for x in pivot.index.tolist()]
     years = {ym[:4] for ym in yms}
     if len(years) <= 1:
-        x_labels = [pd.Timestamp(ym + "-01").strftime("%b") for ym in yms]
+        x_labels = [pd.Timestamp(f"{ym}-01").strftime("%b") for ym in yms]
     else:
-        x_labels = [pd.Timestamp(ym + "-01").strftime("%b %y") for ym in yms]
+        x_labels = [pd.Timestamp(f"{ym}-01").strftime("%b %y") for ym in yms]
 
-    t0 = pd.Timestamp(yms[0] + "-01").strftime("%b %Y")
-    t1 = pd.Timestamp(yms[-1] + "-01").strftime("%b %Y")
+    t0 = pd.Timestamp(f"{yms[0]}-01").strftime("%b %Y")
+    t1 = pd.Timestamp(f"{yms[-1]}-01").strftime("%b %Y")
     range_caption = t0 if yms[0] == yms[-1] else f"{t0} – {t1}"
 
     _card_start(
@@ -282,6 +359,33 @@ def _card_start(title: str, subtitle: str = ""):
     )
 
 
+def _inject_sidebar_nav_label_css() -> None:
+    """Injected after the nav radio so rules win over Streamlit's default widget text (dark on light theme)."""
+    st.sidebar.markdown(
+        """
+        <style>
+        section[data-testid="stSidebar"] div.stRadio,
+        section[data-testid="stSidebar"] div.stRadio p,
+        section[data-testid="stSidebar"] div.stRadio span,
+        section[data-testid="stSidebar"] div.stRadio label,
+        section[data-testid="stSidebar"] div.stRadio label *,
+        section[data-testid="stSidebar"] div.stRadio div[role="radiogroup"],
+        section[data-testid="stSidebar"] div.stRadio div[role="radiogroup"] *,
+        section[data-testid="stSidebar"] div[data-baseweb="radio"] label,
+        section[data-testid="stSidebar"] div[data-baseweb="radio"] label * {
+            color: #ffffff !important;
+            -webkit-text-fill-color: #ffffff !important;
+            opacity: 1 !important;
+        }
+        section[data-testid="stSidebar"] div.stRadio input[type="radio"] {
+            accent-color: #c9a227;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_sidebar_nav():
     st.sidebar.markdown(
         f"""
@@ -293,25 +397,26 @@ def render_sidebar_nav():
         """,
         unsafe_allow_html=True,
     )
-    st.sidebar.markdown("**ANALYTICS**")
-    pages_analytics = [
+    st.sidebar.markdown(
+        '<p style="color:#ffffff;font-weight:700;font-size:0.82rem;letter-spacing:0.12em;margin:0.75rem 0 0.5rem 0;">ANALYTICS</p>',
+        unsafe_allow_html=True,
+    )
+    pages_nav = [
         ("Overview", "overview"),
         ("Skills Demand", "skills"),
         ("Salary Insights", "salary"),
         ("Top Companies", "companies"),
-    ]
-    st.sidebar.markdown("**ML**")
-    pages_ml = [
         ("Salary Predictor", "predictor"),
+        ("Logging & monitoring", "ops_logging"),
     ]
-    options = [p[0] for p in pages_analytics + pages_ml]
-    keys = [p[1] for p in pages_analytics + pages_ml]
+    options = [p[0] for p in pages_nav]
+    keys = [p[1] for p in pages_nav]
 
     if "nav_page" not in st.session_state:
         st.session_state.nav_page = "overview"
 
     current_label = None
-    for lab, key in pages_analytics + pages_ml:
+    for lab, key in pages_nav:
         if key == st.session_state.nav_page:
             current_label = lab
             break
@@ -323,6 +428,7 @@ def render_sidebar_nav():
         label_visibility="collapsed",
     )
     st.session_state.nav_page = keys[options.index(choice)]
+    _inject_sidebar_nav_label_css()
 
 
 def render_top_bar():
@@ -411,6 +517,7 @@ def page_overview():
             src["src"] = src["src"].replace({"Synthetic": "Rozee"})
             src = src.groupby("src", as_index=False)["cnt"].sum().sort_values("cnt", ascending=False)
             src = src[src["cnt"] > 0]
+            src = _arrow_friendly_df(src)
         if not src.empty and _HAS_MPL:
             total = float(src["cnt"].sum()) or 1.0
 
@@ -445,7 +552,7 @@ def page_overview():
             fig.tight_layout()
             st.pyplot(fig, clear_figure=True)
         elif not src.empty:
-            st.bar_chart(src.set_index("src"))
+            st.bar_chart(_arrow_friendly_df(src).set_index("src"))
         else:
             st.caption("No data.")
 
@@ -462,7 +569,7 @@ def page_overview():
             """
         )
         if not city.empty:
-            st.bar_chart(city.set_index("city"))
+            st.bar_chart(_arrow_friendly_df(city).set_index("city"))
         else:
             st.caption("No city data.")
 
@@ -492,7 +599,7 @@ def page_skills():
     )
     if not df_full.empty:
         df_full["demand"] = df_full["demand"].fillna(0).astype(int)
-        df_line = df_full.sort_values("demand", ascending=False).head(15)
+        df_line = _arrow_friendly_df(df_full.sort_values("demand", ascending=False).head(15))
         if _HAS_MPL:
             import matplotlib.ticker as mticker
 
@@ -531,7 +638,7 @@ def page_skills():
             fig.tight_layout()
             st.pyplot(fig, clear_figure=True)
         else:
-            st.bar_chart(df_line.set_index("Skill"))
+            st.bar_chart(_arrow_friendly_df(df_line).set_index("Skill"))
     else:
         st.info("No skills data.")
         df_full = pd.DataFrame()
@@ -573,7 +680,7 @@ def page_skills():
         if not df_full.empty:
             top = df_full.sort_values("demand", ascending=False).head(5)
             low = df_full.sort_values("demand", ascending=True).head(3)
-            mix = pd.concat([top, low])
+            mix = _arrow_friendly_df(pd.concat([top, low]))
             st.bar_chart(mix.set_index("Skill"))
         else:
             st.caption("—")
@@ -596,6 +703,7 @@ def page_salary():
         """
     )
     if not role_df.empty:
+        role_df = _arrow_friendly_df(role_df)
         plot_df = role_df.set_index("role_title")[["avg_min", "avg_max"]].rename(
             columns={"avg_min": "Min (avg)", "avg_max": "Max (avg)"}
         )
@@ -618,7 +726,7 @@ def page_salary():
             """
         )
         if not city_sal.empty:
-            st.bar_chart(city_sal.set_index("city"))
+            st.bar_chart(_arrow_friendly_df(city_sal).set_index("city"))
         else:
             st.caption("—")
 
@@ -627,7 +735,7 @@ def page_salary():
         if not role_df.empty:
             xp = np.arange(len(role_df))
             y = role_df["avg_max"].astype(float).values
-            line_df = pd.DataFrame({"x": xp, "y": y}).set_index("x")
+            line_df = _arrow_friendly_df(pd.DataFrame({"x": xp, "y": y})).set_index("x")
             st.line_chart(line_df)
         else:
             st.caption("—")
@@ -646,7 +754,7 @@ def page_companies():
         """
     )
     if not co.empty:
-        st.bar_chart(co.set_index("company"))
+        st.bar_chart(_arrow_friendly_df(co).set_index("company"))
     else:
         st.info("No company data.")
 
@@ -707,7 +815,7 @@ def page_companies():
         """
     )
     if not tbl.empty:
-        st.dataframe(tbl, use_container_width=True)
+        st.dataframe(_arrow_friendly_df(tbl), use_container_width=True)
     else:
         st.caption("—")
 
@@ -743,6 +851,13 @@ def page_predictor():
                         [[p_city, p_role, int(p_exp)]],
                         columns=["city", "job_role", "experience_years"],
                     )
+                    _LOG.info(
+                        "salary_inference request city=%r role=%r years=%s skill=%r",
+                        p_city,
+                        p_role,
+                        int(p_exp),
+                        p_skill,
+                    )
                     base = float(model.predict(input_df)[0])
                     # Training historically used random / flat experience for bulk synthetic rows;
                     # add a transparent market prior so years of experience visibly move the needle.
@@ -751,15 +866,30 @@ def page_predictor():
                     pred = base * (1.0 + exp_per_year * (float(p_exp) - exp_anchor))
                     pred = max(35_000.0, min(pred, base * 2.35))
                     lo, hi = pred * 0.88, pred * 1.14
+                    _LOG.info(
+                        "salary_inference ok rf_base=%.2f adjusted=%.2f range=(%.2f, %.2f)",
+                        base,
+                        pred,
+                        lo,
+                        hi,
+                    )
                     st.success(f"**Predicted Monthly Salary:** PKR {pred:,.0f}")
                     st.caption(f"Estimated range: PKR {lo:,.0f} – PKR {hi:,.0f}")
                     st.caption(
                         f"_Skill “{p_skill}” is not in the model yet. City, role, and experience drive the RF; "
                         f"a small experience curve (~{exp_per_year*100:.1f}%/yr vs {exp_anchor:.0f}y anchor) is applied so seniority shows in the number._"
                     )
+                    st.session_state["_inf_attempts"] = st.session_state.get("_inf_attempts", 0) + 1
+                    st.session_state["_inf_ok"] = st.session_state.get("_inf_ok", 0) + 1
                 except Exception as e:
+                    _LOG.exception("salary_inference failed: %s", e)
+                    st.session_state["_inf_attempts"] = st.session_state.get("_inf_attempts", 0) + 1
+                    st.session_state["_inf_err"] = st.session_state.get("_inf_err", 0) + 1
                     st.error(str(e))
             else:
+                _LOG.warning("salary_inference skipped: model missing at %s", model_path)
+                st.session_state["_inf_attempts"] = st.session_state.get("_inf_attempts", 0) + 1
+                st.session_state["_inf_skip"] = st.session_state.get("_inf_skip", 0) + 1
                 st.warning("Model file missing. Run training or pipeline.")
 
     with c2:
@@ -777,7 +907,154 @@ def page_predictor():
         st.caption("Figures reflect last DB-backed training run on this machine.")
 
 
+def _read_ops_runbook_md() -> str:
+    path = Path(BASE_DIR) / "docs" / "logging_and_monitoring.md"
+    if path.is_file():
+        return path.read_text(encoding="utf-8")
+    return "_Could not find `docs/logging_and_monitoring.md`._"
+
+
+def page_logging_monitoring():
+    _card_start(
+        "Logging & monitoring",
+        "Pipeline and inference signals, Prefect run history (when the API is reachable), and a short debug runbook.",
+    )
+    view = st.radio(
+        "Choose a view",
+        (
+            "Health & log metrics",
+            "Monitoring & debug runbook",
+            "Recent Prefect runs (API)",
+        ),
+        horizontal=True,
+    )
+
+    if view == "Health & log metrics":
+        c1, c2, c3, c4 = st.columns(4)
+        db_ms = None
+        db_ok = False
+        try:
+            engine = get_db_engine()
+            t0 = time.perf_counter()
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            db_ms = (time.perf_counter() - t0) * 1000.0
+            db_ok = True
+        except Exception as e:
+            _LOG.warning("ops health DB ping failed: %s", e)
+            metric_card(c1, "Database", "Unreachable", COL_GOLD, str(e)[:80])
+        if db_ok and db_ms is not None:
+            metric_card(c1, "Database ping", f"{db_ms:.0f} ms", COL_ACCENT, "SELECT 1")
+
+        counts = {"jobs": "—", "salaries": "—", "companies": "—"}
+        if db_ok:
+            try:
+                engine = get_db_engine()
+                q = text(
+                    """
+                    SELECT
+                        (SELECT COUNT(*) FROM jobs) AS jobs,
+                        (SELECT COUNT(*) FROM salaries) AS salaries,
+                        (SELECT COUNT(*) FROM companies) AS companies
+                    """
+                )
+                with engine.connect() as conn:
+                    row = conn.execute(q).mappings().first()
+                if row:
+                    counts = {k: f"{int(row[k]):,}" for k in counts}
+            except Exception as e:
+                _LOG.warning("ops health counts failed: %s", e)
+
+        metric_card(c2, "Job rows", counts["jobs"], COL_ACCENT)
+        metric_card(c3, "Salary rows", counts["salaries"], COL_ACCENT)
+        metric_card(c4, "Companies", counts["companies"], COL_ACCENT)
+
+        st.markdown("---")
+        st.markdown("**Model artifact**")
+        mp = Path(BASE_DIR) / "analytics_ml" / "salary_prediction" / "salary_model.pkl"
+        if mp.is_file():
+            stat = mp.stat()
+            mtime = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+            sz_mb = stat.st_size / (1024 * 1024)
+            st.success(f"`salary_model.pkl` present — **{sz_mb:.2f} MB**, last modified **{mtime}**.")
+        else:
+            st.warning("`salary_model.pkl` missing — run the Prefect pipeline or train locally.")
+
+        st.markdown("**Log configuration**")
+        st.caption(
+            f"Process **`LOG_LEVEL`**: `{os.environ.get('LOG_LEVEL', 'INFO')}` · "
+            "Inference lines are logged under the `dashboard.app` logger (stdout / `docker logs` for the dashboard)."
+        )
+
+        st.markdown("**This session — salary predictor**")
+        s1, s2, s3, s4 = st.columns(4)
+        metric_card(s1, "Attempts", str(st.session_state.get("_inf_attempts", 0)), COL_ACCENT)
+        metric_card(s2, "Succeeded", str(st.session_state.get("_inf_ok", 0)), COL_ACCENT)
+        metric_card(s3, "Errors", str(st.session_state.get("_inf_err", 0)), COL_GOLD)
+        metric_card(s4, "Skipped (no model)", str(st.session_state.get("_inf_skip", 0)), COL_MUTED)
+
+    elif view == "Monitoring & debug runbook":
+        st.markdown(_read_ops_runbook_md())
+        st.info(
+            "**Tip:** Prefect UI is usually at [http://localhost:4200](http://localhost:4200). "
+            "From Docker Compose, the API base is `http://prefect-server:4200/api` inside the network."
+        )
+
+    else:
+        api = os.environ.get("PREFECT_API_URL", "http://127.0.0.1:4200/api").rstrip("/")
+        st.caption(f"Using **`PREFECT_API_URL`** = `{api}`")
+        try:
+            hr = requests.get(f"{api}/health", timeout=4)
+            if hr.ok:
+                st.success("Prefect API health check: **OK**")
+            else:
+                st.warning(f"Prefect `/health` returned HTTP {hr.status_code}")
+        except Exception as e:
+            st.error(f"Cannot reach Prefect API (`/health`): {e}")
+            st.caption(
+                "If the dashboard runs in Docker, set `PREFECT_API_URL=http://prefect-server:4200/api` "
+                "(already set in `docker-compose` for `dashboard`). On the host only, use `http://127.0.0.1:4200/api`."
+            )
+            return
+
+        try:
+            fr = requests.post(f"{api}/flow_runs/filter", json={"limit": 25}, timeout=8)
+            fr.raise_for_status()
+            runs = fr.json()
+        except Exception as e:
+            st.error(f"Could not list flow runs: {e}")
+            return
+
+        if not runs:
+            st.info("No flow runs returned yet — trigger a run from the Prefect UI or wait for the schedule.")
+            return
+
+        rows = []
+        for u in runs:
+            st_payload = u.get("state") or {}
+            if isinstance(st_payload, dict):
+                st_name = st_payload.get("name") or u.get("state_name") or u.get("state_type")
+            else:
+                st_name = u.get("state_type") or u.get("state_name")
+            rows.append(
+                {
+                    "Run name": u.get("name"),
+                    "State": st_name,
+                    "Start": (u.get("start_time") or "")[:19].replace("T", " "),
+                    "End": (u.get("end_time") or "")[:19].replace("T", " "),
+                    "Run ID": str(u.get("id", "")),
+                }
+            )
+        st.markdown("**Latest flow runs** (newest first from API)")
+        st.dataframe(
+            _arrow_friendly_df(pd.DataFrame(rows)),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
 def main():
+    _configure_logging()
     st.set_page_config(
         page_title="Pakistan Tech Job Market Intelligence",
         page_icon="🇵🇰",
@@ -799,6 +1076,8 @@ def main():
         page_companies()
     elif page == "predictor":
         page_predictor()
+    elif page == "ops_logging":
+        page_logging_monitoring()
     else:
         page_overview()
 

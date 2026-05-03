@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+*.zip
+
+# Kaggle extracts (manifest stays tracked under data/static_jobs/kaggle/)
+data/static_jobs/kaggle/*/
+
+# EDA outputs (regenerate with python analytics_ml/eda/run_eda.py)
+analytics_ml/eda/output/*
+!analytics_ml/eda/output/.gitkeep

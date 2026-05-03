@@ -1,4 +1,5 @@
-FROM python:3.9-slim
+# Prefect 3.6+ requires Python >=3.10 (aligned with prefecthq/prefect:3-python3.10).
+FROM python:3.10-slim
 
 WORKDIR /app
 

@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 from typing import Optional
@@ -11,6 +12,8 @@ from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
+
+logger = logging.getLogger(__name__)
 
 
 def infer_experience_years(title: str, description: Optional[str] = None) -> int:
@@ -67,7 +70,7 @@ def train_salary_model(db_url=None, data_path="sample_data.csv", model_output_pa
     df = pd.DataFrame()
 
     if db_url:
-        print("Connecting to database for training data...")
+        logger.info("Connecting to database for training data...")
         try:
             engine = create_engine(db_url)
             query = """
@@ -96,13 +99,16 @@ def train_salary_model(db_url=None, data_path="sample_data.csv", model_output_pa
                 delta = (desc_len % 9).astype(int) - 4
                 df["experience_years"] = (base_exp + delta).clip(1, 25).astype(int)
                 corr = df["experience_years"].corr(df["average_salary"])
-                print(f"experience_years vs average_salary correlation (Pearson): {corr:.4f}")
-                print(f"experience_years unique values: {df['experience_years'].nunique()}")
-        except Exception as e:
-            print(f"Error reading from database: {e}")
+                logger.info(
+                    "experience_years vs average_salary correlation (Pearson): %s",
+                    f"{corr:.4f}" if pd.notna(corr) else "nan",
+                )
+                logger.info("experience_years unique values: %s", int(df["experience_years"].nunique()))
+        except Exception:
+            logger.exception("Error reading training data from database; falling back if needed.")
 
     if df.empty:
-        print("Using dummy data for model training.")
+        logger.warning("No training rows from DB; using built-in dummy training data.")
         df = pd.DataFrame(
             {
                 "city": ["Lahore", "Karachi", "Islamabad", "Lahore", "Karachi"],
@@ -150,19 +156,20 @@ def train_salary_model(db_url=None, data_path="sample_data.csv", model_output_pa
     else:
         X_train, X_test, y_train, y_test = X, X, y, y
 
-    print("Training model...")
+    logger.info("Training model (rows=%s)...", len(df))
     model.fit(X_train, y_train)
 
     predictions = model.predict(X_test)
     mse = mean_squared_error(y_test, predictions)
     r2 = r2_score(y_test, predictions)
-    print(f"Model MSE: {mse}")
-    print(f"Model R2 Score: {r2}")
+    logger.info("Model holdout MSE: %s", mse)
+    logger.info("Model holdout R2: %s", r2)
 
     os.makedirs(os.path.dirname(model_output_path) or ".", exist_ok=True)
     joblib.dump(model, model_output_path)
-    print(f"Model saved to {model_output_path}")
+    logger.info("Model saved to %s", model_output_path)
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
     train_salary_model(db_url=os.environ.get("DATABASE_URL"))

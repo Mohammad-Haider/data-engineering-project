@@ -12,6 +12,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from data_ingestion.api_clients.adzuna_client import AdzunaClient
 from data_ingestion.api_clients.jsearch_client import JSearchClient
+from data_ingestion.static_datasets.csv_job_loader import load_job_dicts_from_csv_paths
 from data_transformation.cleaners import clean_jobs_dataframe
 from analytics_ml.salary_prediction.train_model import train_salary_model
 
@@ -106,23 +107,49 @@ def extract_jsearch_jobs():
         return [{"title": "Software Engineer", "company": "Global Inc", "location": "Karachi", "salary_raw": None}]
     return jobs
 
-@task
-def transform_jobs(adzuna_data, jsearch_data):
-    """Cleans and deduplicates job data"""
+
+@task(retries=2, retry_delay_seconds=30)
+def extract_static_csv_jobs():
+    """
+    Load local CSV exports (e.g. Kaggle Pakistan job datasets).
+
+    Set ``STATIC_JOBS_CSV_PATHS`` to one or more absolute or project-relative paths,
+    separated by ``;`` or newlines. Optional: ``STATIC_JOBS_CSV_ENCODING`` (default utf-8).
+
+    If unset, loads every ``*.csv`` under ``data/static_jobs/kaggle/*/`` after running
+    ``python scripts/download_kaggle_datasets.py`` (four Kaggle bundles). Set
+    ``STATIC_JOBS_KAGGLE_AUTO=0`` to disable that auto-discovery.
+    """
+    logging.info("Extracting static CSV job dumps...")
+    rows = load_job_dicts_from_csv_paths()
+    if not rows:
+        logging.info(
+            "No static CSV rows loaded (set STATIC_JOBS_CSV_PATHS or add files under data/static_jobs/)."
+        )
+    return rows
+
+
+@task(retries=2, retry_delay_seconds=45)
+def transform_jobs(adzuna_data, jsearch_data, static_csv_data):
+    """Cleans and deduplicates job data from APIs and optional CSV/Kaggle dumps."""
     logging.info("Transforming combined data...")
-    combined_data = adzuna_data + jsearch_data
+    static_csv_data = static_csv_data or []
+    combined_data = adzuna_data + jsearch_data + list(static_csv_data)
     df = pd.DataFrame(combined_data)
     clean_df = clean_jobs_dataframe(df)
     return clean_df
 
-@task
+@task(retries=3, retry_delay_seconds=60)
 def load_to_mysql(cleaned_df):
     """Loads cleaned data into MySQL database"""
     logging.info(f"Loading {len(cleaned_df)} records to MySQL...")
     engine = create_engine(DB_URL)
 
-    def safe_text(value, default=""):
-        return default if pd.isna(value) else value
+    def safe_text(value, default="", max_len=None):
+        s = default if pd.isna(value) else str(value)
+        if max_len is not None and len(s) > max_len:
+            return s[:max_len]
+        return s
     
     with engine.begin() as conn:
         for _, row in cleaned_df.iterrows():
@@ -153,7 +180,7 @@ def load_to_mysql(cleaned_df):
                     ON DUPLICATE KEY UPDATE title=title
                     """),
                     {
-                        "title": safe_text(row.get('title', '')),
+                        "title": safe_text(row.get('title', ''), max_len=255),
                         "company_id": company_id,
                         "location": safe_text(row.get('location_clean', row.get('location', ''))),
                         "source": safe_text(row.get('source', '')),
@@ -192,24 +219,22 @@ def load_to_mysql(cleaned_df):
                     }
                 )
 
-@task
+@task(retries=2, retry_delay_seconds=120)
 def trigger_model_training():
     """Trains the ML model using data from the database"""
     logging.info("Triggering ML model training...")
-    try:
-        train_salary_model(db_url=DB_URL)
-    except Exception as e:
-        logging.error(f"Model training failed: {e}")
+    train_salary_model(db_url=DB_URL)
 
-@flow(name="Daily Job Market Ingestion Pipeline")
+@flow(name="Daily Job Market Ingestion Pipeline", log_prints=True)
 def daily_job_pipeline():
     """Main execution flow"""
     # 1. Extraction
     adzuna_data = extract_adzuna_jobs()
     jsearch_data = extract_jsearch_jobs()
-    
+    static_csv_data = extract_static_csv_jobs()
+
     # 2. Transformation
-    cleaned_data = transform_jobs(adzuna_data, jsearch_data)
+    cleaned_data = transform_jobs(adzuna_data, jsearch_data, static_csv_data)
     
     # 3. Loading
     load_to_mysql(cleaned_data)

@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     title VARCHAR(255) NOT NULL,
     company_id INT,
     location VARCHAR(255),
-    source VARCHAR(50),
+    source VARCHAR(191),
     description TEXT,
     fingerprint VARCHAR(255) UNIQUE, -- Hash of title + company + location to prevent duplicates
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

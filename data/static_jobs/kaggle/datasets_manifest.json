@@ -1,0 +1,25 @@
+{
+  "description": "Four Pakistan-focused job posting datasets on Kaggle. Run scripts/download_kaggle_datasets.py after placing API credentials in ~/.kaggle/kaggle.json (see https://www.kaggle.com/docs/api).",
+  "datasets": [
+    {
+      "slug": "zincly/pakistan-job-market-dataset-rozee-pk",
+      "name": "rozee_pk",
+      "title": "Pakistan Job Market Dataset (Rozee.pk)"
+    },
+    {
+      "slug": "devmarwat/pakistan-jobs",
+      "name": "pakistan_jobs_linkedin",
+      "title": "Pakistan Jobs (LinkedIn-oriented listings)"
+    },
+    {
+      "slug": "sarabcheema/pakistan-job-dataset",
+      "name": "pakistan_job_preprocessed",
+      "title": "Pakistan job dataset (preprocessed)"
+    },
+    {
+      "slug": "techsalerator/job-posting-data-in-pakistan",
+      "name": "techsalerator_pk",
+      "title": "Job Posting Data in Pakistan (Techsalerator)"
+    }
+  ]
+}
